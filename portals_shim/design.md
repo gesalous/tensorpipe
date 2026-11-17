@@ -86,6 +86,22 @@ TCP socket and applied with `modify_qp`. So the SPDK control-plane server
   `WC_RECV` (+imm) -> "remote consumed `imm` bytes";
   `WC_RDMA_WRITE` / `WC_SEND` -> local send completions (flow control).
 
+**Messages versus operations.** The transport is a byte stream per connection,
+not a message transport: `write` copies into a 2 MiB outbox ring, `read` copies
+out of the 2 MiB inbox ring, and the layers above (channels) frame their own
+messages. Only two verbs ever reach the wire, confirmed by grep (no
+`RDMA_READ`, no atomics anywhere in `transport/ibv`):
+
+| Operation | Verb | Role |
+|---|---|---|
+| data | `RDMA_WRITE_WITH_IMM`, `imm = length` | one-sided placement into the peer inbox at `peerInboxPtr + (head mod 2 MiB)`; wrap-around is two writes; the imm raises the receive completion |
+| ack | `SEND_WITH_IMM`, zero length, `imm = bytes consumed` | frees ring space on the sender |
+
+On Portals both are a `PtlPut` into the context's persistent LE: the data write
+has `length` bytes and `remote_offset = remote address`, the ack has length 0;
+`hdr_data` carries the kind (5.5). The ordering hazard of section 6 applies to
+the data writes.
+
 ## 5. Mapping to Portals4 (proposed, **OPEN**)
 
 ### 5.1 Interface and PTEs (implemented in sprint 1)
