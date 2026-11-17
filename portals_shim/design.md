@@ -53,19 +53,20 @@ Calls used by tensorpipe (from `common/ibv_lib.h`):
 
 | Call | Now | Portals-backed plan |
 |---|---|---|
-| get_device_list / free / get_device_name | stub | one fake device ("portals0"); **TBD** gating on a BXI NI being available |
-| open_device / close_device | stub | process-wide NI (refcounted) + ops table |
-| query_port | stub | report ACTIVE, MTU, a fixed lid |
-| query_gid | stub | gid encodes `(nid, pid, pte)`: see 5 |
-| alloc_pd / dealloc_pd | stub | trivial object |
+| get_device_list / free / get_device_name | **done** | one fake device `portals0`; the list is empty if the process-wide NI cannot be created, so tensorpipe reports the transport as not viable |
+| open_device / close_device | **done** | process-wide NI (lazy, released at exit); per context: EQ, whole-address MD, one PTE, one persistent whole-address LE (5.1) |
+| query_port | **done** | ACTIVE, MTU 4096, `lid = 0` so tensorpipe addresses peers by gid |
+| query_gid | **done** | gid = `"PTL4"`, nid, pid, pte (`struct ptl_gid`) |
+| alloc_pd / dealloc_pd | **done** | trivial object |
 | reg_mr / dereg_mr | stub | **OPEN** see 5.3 |
-| create_cq / destroy_cq | stub | a Portals EQ |
-| create_srq / destroy_srq | stub | **OPEN** see 5.4 |
+| create_cq / destroy_cq | **done** | a *logical* CQ: every event of a context arrives on the context's one EQ (5.1), so several CQs can share it |
+| create_srq / destroy_srq | **done** | accounting only (5.4): ring of posted wr_ids |
 | create_qp / destroy_qp | stub | local state: qpn, peer identity, sequence numbers |
 | modify_qp | stub | INIT/RTR/RTS: store peer `(nid,pid,pte,qpn)` from `ah_attr` + `dest_qp_num` |
 | post_send | stub | `RDMA_WRITE_WITH_IMM` -> PtlPut to RMA window; `SEND_WITH_IMM` -> PtlPut to message LE |
-| post_srq_recv / post_recv | stub | see 5.4 |
-| poll_cq | stub | PtlEQGet -> synthesise `ibv_wc`, in per-QP order (6) |
+| post_srq_recv | **done** | records wr_ids; only zero-sge receives (FATAL otherwise) |
+| post_recv | stub | not called by any `Ibv*` test |
+| poll_cq | partial | T1: drains nothing and returns 0; any event is FATAL until the data path (T3) |
 | get_async_event / ack_async_event | stub | no events generated initially |
 | event_type_str / wc_status_str | stub | local tables |
 
@@ -87,10 +88,18 @@ TCP socket and applied with `modify_qp`. So the SPDK control-plane server
 
 ## 5. Mapping to Portals4 (proposed, **OPEN**)
 
-### 5.1 Interface and PTEs
+### 5.1 Interface and PTEs (implemented in sprint 1)
 Non-matching NI, physical addressing (as in the SPDK non-matching branch).
-Per process: one NI, one EQ per CQ, and two PTEs: *message* (zero-length
-acks / sends) and *RMA* (the write window).
+- **One NI per process**, created lazily, finalised at exit (`ptl_ni.c`). The
+  NIC has only 64 command queues and every `PtlNIInit` takes one (section 11).
+- **Per ibv_context** (`ptl_open_device`): one EQ (65536 events), one
+  whole-address-space MD for sends, **one PTE** bound to that EQ, and **one
+  persistent whole-address-space LE** on it (`start=0, length=PTL_SIZE_MAX`,
+  `OP_PUT|OP_GET`, no `USE_ONCE`, comm events on). RMA writes and zero-length
+  sends both land on this single LE; `hdr_data` says which kind. This replaces
+  the earlier plan of separate message and RMA PTEs.
+- CQs are logical: `poll_cq` drains the context EQ and routes completions.
+- Teardown order: LE unlink, PTE free, MD release, EQ free (same as SPDK).
 
 ### 5.2 Peer identity
 `gid` (16 B) carries `nid`, `pid`, PTE indices; `dest_qp_num` is the peer qpn.
@@ -172,7 +181,7 @@ was recorded (`portals_shim/test-call-matrix.txt`, measured with the forwarding 
 | Tier | Tests | New functions needed | Data path |
 |---|---|---|---|
 | T0 | `IbvSockaddr.*` (4) | none | none |
-| T1 | `Context_DomainDescriptor`, `Listener_CreateAfterClosingContextAndThenGetAddress` | get/free_device_list, open/close_device, query_port, query_gid, alloc/dealloc_pd, create/destroy_cq, create/destroy_srq | `post_srq_recv` (32), `poll_cq` |
+| T1 (**passes**) | `Context_DomainDescriptor`, `Listener_CreateAfterClosingContextAndThenGetAddress` | get/free_device_list, open/close_device, query_port, query_gid, alloc/dealloc_pd, create/destroy_cq, create/destroy_srq | `post_srq_recv` (32), `poll_cq` |
 | T2 | `Context_Basics`, `Listener_Basics`, `Listener_CreateThenClose...`, `Listener_AcceptCallbacksAreQueued`, `Listener_IncomingConnectionsAreQueued`, `Connection_InitializationError` | create/destroy_qp, **modify_qp** (INIT/RTR/RTS), reg_mr, dereg_mr | still no `post_send` |
 | T3 | `Connection_Initialization`, `Connection_NopWrite` | none new | first `post_send` (2): one write-with-imm + ack, tiny |
 | T4 | `Connection_QueueWritesBeforeReads` (20 sends), `IbvTransportTest.QueueWrites` (6), `NopWriteWrapAround` (7) | none new | many writes on one QP: **first real exercise of ordering** (section 6), ring wrap-around |
@@ -199,12 +208,32 @@ Observations that shape the implementation:
 |---|---|---|
 | 0 | `TP_IBV_LIBRARY` loader, `ptl_*` forwarding shim, baseline | done, 19/19 on borg1 (forwarding bodies since replaced by stubs) |
 | 0b | All `ptl_*` bodies replaced by FATAL stubs; test ladder + `run_tiers.sh` | done: T0 passes, T1+ abort at `ptl_get_device_list` |
-| 1 | T1: NI/EQ/PTE bring-up, fake device, PD, CQ, SRQ | planned |
+| 1 | T1: NI/EQ/PTE bring-up, fake device, PD, CQ, SRQ | **done**: T1 passes, 200/200 repetitions on borg0 and borg1 |
 | 2 | T2: QP state, `modify_qp`, MR | planned |
 | 3 | T3+T4: `post_send` (write-imm, send-imm), receive path, `poll_cq`, sequence numbers + reorder buffer, fault-injection test | planned |
 | 4 | T5, cross-host borg0 <-> borg1, then pipe/channel tests | planned |
 
-## 11. Open questions (summary)
+## 11. Hardware facts from the BXI reverse-engineering work
+
+Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,
+`/home/gesalous/claude/bxi_inc_from_gpu`; binaries `bxi.ko`, `bxi-portals.ko`,
+`libportals.so` there):
+- **64 command queues per NIC.** Each `PtlNIInit` (a "context") takes one, with
+  its own PID, TX ring, EQ and MD; the 65th fails with `PTL_NO_SPACE` (rc 6)
+  (`04_multi_command_queues/README.md`). Hence one NI per process here. A node
+  with many PyTorch worker processes, or other Portals jobs, can exhaust them.
+- **A single persistent LE works at rate.** `08_portals_rate/bigle.c`: one 128 MiB
+  persistent LE, 512 B puts: about 4.0 M puts/s with no events, 1.8 M/s when the
+  initiator takes send events, 1.4 M/s with send + ack events, one initiator.
+  Supports the persistent-LE receive design (5.4).
+- **Per-message entries lose messages.** With a pool of re-appended entries
+  (`reappend_qd*.txt`) acks failed (`last_fail_type=4`) when entries were not
+  re-posted in time. A persistent LE has no such window.
+- Node ids: borg0 = nid 100, borg1 = nid 101 (physical NI).
+- First PTE handed out by `PTL_PT_ANY` is 0 (SPDK reserves PTE 0 for its
+  control plane; we have no control plane).
+
+## 12. Open questions (summary)
 1. rkey enforcement vs whole-address-space LE (5.3).
 2. `hdr_data` layout (5.5).
 3. EQ sizing / overflow policy (5.4).
