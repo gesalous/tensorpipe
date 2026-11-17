@@ -30,8 +30,8 @@ tensorpipe ibv transport (unchanged call sites)
    |  IbvLib: dlopen(TP_IBV_LIBRARY, RTLD_LOCAL), symbols resolved as ptl_<name>
    v
 libtensorpipe_portals.so  (portals_shim/)     exports ptl_* with ibv_* signatures
-   |  sprint 0: forwards to real libibverbs
-   |  later:    Portals4 (PtlNIInit, PtlPut, PtlGet, PtlLEAppend, PtlEQGet ...)
+   |  now:   every function is a FATAL "unimplemented" stub
+   |  goal:  Portals4 (PtlNIInit, PtlPut, PtlGet, PtlLEAppend, PtlEQGet ...)
    v
 libportals -> BXIv2
 ```
@@ -42,31 +42,32 @@ libportals -> BXIv2
   inline in `verbs.h` and dispatch through `ibv_context.ops`; stock libibverbs
   doesn't export them. `IbvLib` therefore loads `ptl_poll_cq` etc. as function
   pointers in override mode.
-- The shim never calls `ibv_*` internally once Portals-backed (it would resolve
-  to the real library). It links only libportals and libc.
+- The shim never calls `ibv_*` and does not link libibverbs (it would resolve to
+  the real library). It links only libportals and libc. Checked: the built
+  library has no undefined `ibv_*` symbols.
 - Symbol visibility: everything hidden except the `ptl_*` exports.
 
 ## 4. Verbs surface to implement
 
 Calls used by tensorpipe (from `common/ibv_lib.h`):
 
-| Call | Sprint-0 | Portals-backed plan |
+| Call | Now | Portals-backed plan |
 |---|---|---|
-| get_device_list / free / get_device_name | forward | one fake device ("portals0"); **TBD** gating on a BXI NI being available |
-| open_device / close_device | forward | process-wide NI (refcounted) + ops table |
-| query_port | forward | report ACTIVE, MTU, a fixed lid |
-| query_gid | forward | gid encodes `(nid, pid, pte)`: see 5 |
-| alloc_pd / dealloc_pd | forward | trivial object |
-| reg_mr / dereg_mr | forward | **OPEN** see 5.3 |
-| create_cq / destroy_cq | forward | a Portals EQ |
-| create_srq / destroy_srq | forward | **OPEN** see 5.4 |
-| create_qp / destroy_qp | forward | local state: qpn, peer identity, sequence numbers |
-| modify_qp | forward | INIT/RTR/RTS: store peer `(nid,pid,pte,qpn)` from `ah_attr` + `dest_qp_num` |
-| post_send | forward | `RDMA_WRITE_WITH_IMM` -> PtlPut to RMA window; `SEND_WITH_IMM` -> PtlPut to message LE |
-| post_srq_recv / post_recv | forward | see 5.4 |
-| poll_cq | forward | PtlEQGet -> synthesise `ibv_wc`, in per-QP order (6) |
-| get_async_event / ack_async_event | forward | no events generated initially |
-| event_type_str / wc_status_str | forward | local tables |
+| get_device_list / free / get_device_name | stub | one fake device ("portals0"); **TBD** gating on a BXI NI being available |
+| open_device / close_device | stub | process-wide NI (refcounted) + ops table |
+| query_port | stub | report ACTIVE, MTU, a fixed lid |
+| query_gid | stub | gid encodes `(nid, pid, pte)`: see 5 |
+| alloc_pd / dealloc_pd | stub | trivial object |
+| reg_mr / dereg_mr | stub | **OPEN** see 5.3 |
+| create_cq / destroy_cq | stub | a Portals EQ |
+| create_srq / destroy_srq | stub | **OPEN** see 5.4 |
+| create_qp / destroy_qp | stub | local state: qpn, peer identity, sequence numbers |
+| modify_qp | stub | INIT/RTR/RTS: store peer `(nid,pid,pte,qpn)` from `ah_attr` + `dest_qp_num` |
+| post_send | stub | `RDMA_WRITE_WITH_IMM` -> PtlPut to RMA window; `SEND_WITH_IMM` -> PtlPut to message LE |
+| post_srq_recv / post_recv | stub | see 5.4 |
+| poll_cq | stub | PtlEQGet -> synthesise `ibv_wc`, in per-QP order (6) |
+| get_async_event / ack_async_event | stub | no events generated initially |
+| event_type_str / wc_status_str | stub | local tables |
 
 Tensorpipe does **not** use rdma_cm: QP parameters are exchanged over its own
 TCP socket and applied with `modify_qp`. So the SPDK control-plane server
@@ -157,20 +158,53 @@ but connection threads trigger it). **TBD**: which shim objects need locks.
   bundled googletest with a recent cmake.
 - Run: `TP_IBV_LIBRARY=$PWD/portals_shim/libtensorpipe_portals.so
   tensorpipe/test/tensorpipe_test --gtest_filter='*Ibv*'`
-- `TP_PTL_TRACE=1` logs shim control-path calls and prints data-path call counts.
+- Test ladder: `portals_shim/run_tiers.sh` (stops at the first failing tier;
+  `KEEP_GOING=1` runs all; `STOCK=1` runs against stock verbs as a control).
 - Baseline (stock verbs, borg1): 19/19 `Ibv*` tests pass.
 
-## 9. Sprint log
+## 9. Test ladder
+
+The 19 `Ibv*` tests, ordered simplest first. "Needs" is measured: each test
+was run alone against the (then forwarding) shim and every `ptl_*` call it makes
+was recorded (`portals_shim/test-call-matrix.txt`, measured with the forwarding shim of sprint 0). Counts are from one run and vary
+(`poll_cq` is a busy-poll loop).
+
+| Tier | Tests | New functions needed | Data path |
+|---|---|---|---|
+| T0 | `IbvSockaddr.*` (4) | none | none |
+| T1 | `Context_DomainDescriptor`, `Listener_CreateAfterClosingContextAndThenGetAddress` | get/free_device_list, open/close_device, query_port, query_gid, alloc/dealloc_pd, create/destroy_cq, create/destroy_srq | `post_srq_recv` (32), `poll_cq` |
+| T2 | `Context_Basics`, `Listener_Basics`, `Listener_CreateThenClose...`, `Listener_AcceptCallbacksAreQueued`, `Listener_IncomingConnectionsAreQueued`, `Connection_InitializationError` | create/destroy_qp, **modify_qp** (INIT/RTR/RTS), reg_mr, dereg_mr | still no `post_send` |
+| T3 | `Connection_Initialization`, `Connection_NopWrite` | none new | first `post_send` (2): one write-with-imm + ack, tiny |
+| T4 | `Connection_QueueWritesBeforeReads` (20 sends), `IbvTransportTest.QueueWrites` (6), `NopWriteWrapAround` (7) | none new | many writes on one QP: **first real exercise of ordering** (section 6), ring wrap-around |
+| T5 | `IbvTransportTest.Chunking`, `ChunkingImplicitRead` (12 sends each) | none new | large payloads split into ring-sized writes; heavy `poll_cq` |
+
+Observations that shape the implementation:
+- T1 needs no QP, MR, or Portals data movement: pure bring-up. It is the right
+  place to add the NI, EQ and PTE setup and the fake device.
+- `get_async_event`, `ack_async_event`, `event_type_str`, `wc_status_str`,
+  `post_recv` were never called by any `Ibv*` test (`wc_status_str` appears only in
+  verbose logging). They stay stubs until something calls them.
+- Every test creates its own contexts, QPs and MRs within one process: both ends
+  of each connection are in the same process, so the first Portals traffic is
+  loopback to self (same nid/pid). Cross-host (borg0 <-> borg1) needs a separate
+  harness; the unit tests alone will not cover it.
+- T2 is the first place the peer identity, `modify_qp` parameters and qpn
+  allocation (section 5.2) have to be real.
+- Beyond the `Ibv*` tests, `core/pipe_test` and channel tests may select the ibv
+  transport; not yet checked (**TBD**).
+
+## 10. Sprint log
 
 | Sprint | Content | Status |
 |---|---|---|
-| 0 | `TP_IBV_LIBRARY` loader, `ptl_*` forwarding shim, baseline | done, 19/19 on borg1 |
-| 1 | Portals NI/EQ/PTE bring-up, fake device, CQ, loopback PUT/ACK in one process | planned |
-| 2 | QP state, `modify_qp`, `post_send` (write-imm, send-imm) + sequence numbers | planned |
-| 3 | Receive path, `poll_cq`, reorder buffer, reordering fault-injection test | planned |
-| 4 | Cross-host borg0 <-> borg1, full `Ibv*` suite, then pipe/channel tests | planned |
+| 0 | `TP_IBV_LIBRARY` loader, `ptl_*` forwarding shim, baseline | done, 19/19 on borg1 (forwarding bodies since replaced by stubs) |
+| 0b | All `ptl_*` bodies replaced by FATAL stubs; test ladder + `run_tiers.sh` | done: T0 passes, T1+ abort at `ptl_get_device_list` |
+| 1 | T1: NI/EQ/PTE bring-up, fake device, PD, CQ, SRQ | planned |
+| 2 | T2: QP state, `modify_qp`, MR | planned |
+| 3 | T3+T4: `post_send` (write-imm, send-imm), receive path, `poll_cq`, sequence numbers + reorder buffer, fault-injection test | planned |
+| 4 | T5, cross-host borg0 <-> borg1, then pipe/channel tests | planned |
 
-## 10. Open questions (summary)
+## 11. Open questions (summary)
 1. rkey enforcement vs whole-address-space LE (5.3).
 2. `hdr_data` layout (5.5).
 3. EQ sizing / overflow policy (5.4).
