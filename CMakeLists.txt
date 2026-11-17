@@ -23,6 +23,11 @@ include(MiscCheck)
 
 add_subdirectory(tensorpipe)
 
+option(TP_BUILD_PORTALS_SHIM "Build the Portals4 verbs shim (ptl_*), see portals_shim/" OFF)
+if(TP_BUILD_PORTALS_SHIM)
+  add_subdirectory(portals_shim)
+endif()
+
 install(EXPORT TensorpipeTargets
         DESTINATION share/cmake/Tensorpipe
         FILE TensorpipeTargets.cmake)

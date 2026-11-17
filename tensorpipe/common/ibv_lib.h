@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 #include <tensorpipe/common/defs.h>
 #include <tensorpipe/common/dl.h>
@@ -622,6 +624,18 @@ class IbvLib {
   TP_FORALL_IBV_SYMBOLS(TP_DECLARE_FIELD)
 #undef TP_DECLARE_FIELD
 
+  // Data-path functions. Stock libibverbs doesn't export them: they are inline
+  // and go through the function pointers stored on the ibv_context. A
+  // replacement library selected through TP_IBV_LIBRARY exports them instead
+  // (as ptl_poll_cq, ...); when these are null we use the inline path.
+  int (*poll_cq_ptr_)(IbvLib::cq*, int, IbvLib::wc*) = nullptr;
+  int (*post_send_ptr_)(IbvLib::qp*, IbvLib::send_wr*, IbvLib::send_wr**) =
+      nullptr;
+  int (*post_recv_ptr_)(IbvLib::qp*, IbvLib::recv_wr*, IbvLib::recv_wr**) =
+      nullptr;
+  int (*post_srq_recv_ptr_)(IbvLib::srq*, IbvLib::recv_wr*, IbvLib::recv_wr**) =
+      nullptr;
+
  public:
   IbvLib() = default;
 
@@ -636,11 +650,19 @@ class IbvLib {
   static std::tuple<Error, IbvLib> create() {
     Error error;
     DynamicLibraryHandle dlhandle;
+    // TP_IBV_LIBRARY, when set, names a library that implements the verbs API
+    // under a "ptl_" prefix (ptl_open_device, ptl_post_send, ...) in place of
+    // libibverbs. It is used only by this IbvLib instance: other users of
+    // libibverbs in the same process (NCCL, Gloo, ...) are not affected.
+    const char* overrideLib = std::getenv("TP_IBV_LIBRARY");
+    const bool useOverride = overrideLib != nullptr && overrideLib[0] != '\0';
+    const std::string libName = useOverride ? overrideLib : "libibverbs.so.1";
+    const std::string symPrefix = useOverride ? "ptl_" : "ibv_";
     // To keep things "neat" and contained, we open in "local" mode (as opposed
     // to global) so that the ibverbs symbols can only be resolved through this
     // handle and are not exposed (a.k.a., "leaded") to other shared objects.
     std::tie(error, dlhandle) =
-        DynamicLibraryHandle::create("libibverbs.so.1", RTLD_LOCAL | RTLD_LAZY);
+        DynamicLibraryHandle::create(libName.c_str(), RTLD_LOCAL | RTLD_LAZY);
     if (error) {
       return std::make_tuple(std::move(error), IbvLib());
     }
@@ -651,16 +673,17 @@ class IbvLib {
       std::string filename;
       std::tie(error, filename) = dlhandle.getFilename();
       if (error) {
-        return "Couldn't determine location of shared library libibverbs.so.1: " +
-            error.what();
+        return "Couldn't determine location of shared library " + libName +
+            ": " + error.what();
       }
-      return "Found shared library libibverbs.so.1 at " + filename;
+      return "Found shared library " + libName + " at " + filename;
     }();
     IbvLib lib(std::move(dlhandle));
 #define TP_LOAD_SYMBOL(function_name, return_type, args_types)              \
   {                                                                         \
     void* ptr;                                                              \
-    std::tie(error, ptr) = lib.dlhandle_.loadSymbol("ibv_" #function_name); \
+    std::tie(error, ptr) =                                                  \
+        lib.dlhandle_.loadSymbol((symPrefix + #function_name).c_str());               \
     if (error) {                                                            \
       return std::make_tuple(std::move(error), IbvLib());                   \
     }                                                                       \
@@ -670,6 +693,23 @@ class IbvLib {
   }
     TP_FORALL_IBV_SYMBOLS(TP_LOAD_SYMBOL)
 #undef TP_LOAD_SYMBOL
+    if (useOverride) {
+#define TP_LOAD_DATAPATH(name)                                              \
+  {                                                                         \
+    void* ptr;                                                              \
+    std::tie(error, ptr) = lib.dlhandle_.loadSymbol((symPrefix + #name).c_str());     \
+    if (error) {                                                            \
+      return std::make_tuple(std::move(error), IbvLib());                   \
+    }                                                                       \
+    TP_THROW_ASSERT_IF(ptr == nullptr);                                     \
+    lib.name##_ptr_ = reinterpret_cast<decltype(lib.name##_ptr_)>(ptr);     \
+  }
+      TP_LOAD_DATAPATH(poll_cq)
+      TP_LOAD_DATAPATH(post_send)
+      TP_LOAD_DATAPATH(post_recv)
+      TP_LOAD_DATAPATH(post_srq_recv)
+#undef TP_LOAD_DATAPATH
+    }
     return std::make_tuple(Error::kSuccess, std::move(lib));
   }
 
@@ -680,16 +720,25 @@ class IbvLib {
   // access a function pointer stored on the ibv_context and execute it.
 
   int poll_cq(IbvLib::cq* cq, int num_entries, IbvLib::wc* wc) const {
+    if (poll_cq_ptr_ != nullptr) {
+      return poll_cq_ptr_(cq, num_entries, wc);
+    }
     return cq->context->ops.poll_cq(cq, num_entries, wc);
   }
 
   int post_send(IbvLib::qp* qp, IbvLib::send_wr* wr, IbvLib::send_wr** bad_wr)
       const {
+    if (post_send_ptr_ != nullptr) {
+      return post_send_ptr_(qp, wr, bad_wr);
+    }
     return qp->context->ops.post_send(qp, wr, bad_wr);
   }
 
   int post_recv(IbvLib::qp* qp, IbvLib::recv_wr* wr, IbvLib::recv_wr** bad_wr)
       const {
+    if (post_recv_ptr_ != nullptr) {
+      return post_recv_ptr_(qp, wr, bad_wr);
+    }
     return qp->context->ops.post_recv(qp, wr, bad_wr);
   }
 
@@ -697,6 +746,9 @@ class IbvLib {
       IbvLib::srq* srq,
       IbvLib::recv_wr* recv_wr,
       IbvLib::recv_wr** bad_recv_wr) const {
+    if (post_srq_recv_ptr_ != nullptr) {
+      return post_srq_recv_ptr_(srq, recv_wr, bad_recv_wr);
+    }
     return srq->context->ops.post_srq_recv(srq, recv_wr, bad_recv_wr);
   }
 };
