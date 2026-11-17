@@ -75,6 +75,16 @@ PTL_EXPORT struct ibv_context *ptl_open_device(struct ibv_device *device)
 	ctx->magic = PTL_MAGIC_CTX;
 	ctx->ni = ni;
 	pthread_mutex_init(&ctx->lock, NULL);
+	pthread_mutex_init(&ctx->qp_lock, NULL);
+	ctx->next_qpn = 1;
+	ctx->qps = calloc((size_t)PTL_MAX_QPN + 1, sizeof(*ctx->qps));
+	if (ctx->qps == NULL) {
+		pthread_mutex_destroy(&ctx->lock);
+		pthread_mutex_destroy(&ctx->qp_lock);
+		free(ctx);
+		errno = ENOMEM;
+		return NULL;
+	}
 	ctx->ibv.device = &g_device;
 	ctx->ibv.cmd_fd = -1;
 	ctx->ibv.async_fd = -1; /* no async events yet */
@@ -136,6 +146,8 @@ err_eq:
 	PtlEQFree(ctx->eq);
 err_free:
 	pthread_mutex_destroy(&ctx->lock);
+	pthread_mutex_destroy(&ctx->qp_lock);
+	free(ctx->qps);
 	free(ctx);
 	errno = EIO;
 	return NULL;
@@ -170,6 +182,8 @@ PTL_EXPORT int ptl_close_device(struct ibv_context *context)
 
 	ctx->magic = 0;
 	pthread_mutex_destroy(&ctx->lock);
+	pthread_mutex_destroy(&ctx->qp_lock);
+	free(ctx->qps);
 	free(ctx);
 	return 0;
 }

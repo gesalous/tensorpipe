@@ -54,6 +54,11 @@ _Static_assert(sizeof(struct ptl_gid) == sizeof(union ibv_gid),
 #define PTL_MAGIC_PD 0x50545044U
 #define PTL_MAGIC_CQ 0x50544351U
 #define PTL_MAGIC_SRQ 0x50545352U
+#define PTL_MAGIC_MR 0x50544d52U
+#define PTL_MAGIC_QP 0x50545150U
+
+/* qpn travels in 16 bits of hdr_data (design.md 9.2); 0 is never assigned. */
+#define PTL_MAX_QPN 65535U
 
 struct ptl_ctx {
 	uint32_t magic;
@@ -64,7 +69,10 @@ struct ptl_ctx {
 	ptl_pt_index_t pte; /* the one PTE peers target */
 	ptl_handle_le_t le; /* persistent whole-address-space LE on that PTE */
 	pthread_mutex_t lock; /* serialises draining the EQ */
-	int open_objects;     /* pds + cqs + srqs still alive: leak check */
+	int open_objects;     /* pds, cqs, srqs, qps still alive: leak check */
+	struct ptl_qp **qps;  /* qpn -> qp, PTL_MAX_QPN + 1 slots */
+	pthread_mutex_t qp_lock;
+	uint32_t next_qpn;
 };
 
 struct ptl_pd {
@@ -91,6 +99,43 @@ struct ptl_srq {
 	uint32_t cap, head, count;
 };
 
+/* Address of the peer end of a connection, from the gid given to modify_qp(RTR). */
+struct ptl_peer {
+	uint32_t nid, pid, pte;
+	uint32_t qpn;
+};
+
+struct ptl_qp {
+	uint32_t magic;
+	struct ibv_qp ibv;
+	struct ptl_ctx *ctx;
+	struct ptl_pd *pd;
+	struct ptl_cq *send_cq, *recv_cq;
+	struct ptl_srq *srq;
+	bool sq_sig_all;     /* every send must complete, acks included */
+	uint32_t max_send_wr;
+	pthread_mutex_t lock; /* state, peer */
+	enum ibv_qp_state state;
+	int access;
+	enum ibv_mtu mtu;
+	bool peer_valid; /* set by RTR */
+	struct ptl_peer peer;
+};
+
+/* A memory region is bookkeeping plus pinning: the NIC resolves addresses itself
+ * (design.md 9.3), so there is no Portals object behind it. */
+struct ptl_mr {
+	uint32_t magic;
+	struct ibv_mr ibv;
+	struct ptl_pd *pd;
+	bool pinned;
+	uintptr_t pstart, pend; /* page-aligned range that was mlocked */
+	struct ptl_mr *next;
+};
+
+/* Finds a live qp by number (receive path, T3). NULL if there is none. */
+struct ptl_qp *ptl_qp_lookup(struct ptl_ctx *ctx, uint32_t qpn);
+
 static inline struct ptl_ctx *ptl_ctx_from_ibv(struct ibv_context *c)
 {
 	struct ptl_ctx *ctx = PTL_CONTAINER_OF(c, struct ptl_ctx, ibv);
@@ -113,6 +158,22 @@ static inline struct ptl_cq *ptl_cq_from_ibv(struct ibv_cq *c)
 	if (cq->magic != PTL_MAGIC_CQ)
 		PTL_FATAL("not a ptl cq: %p", (void *)c);
 	return cq;
+}
+
+static inline struct ptl_qp *ptl_qp_from_ibv(struct ibv_qp *q)
+{
+	struct ptl_qp *qp = PTL_CONTAINER_OF(q, struct ptl_qp, ibv);
+	if (qp->magic != PTL_MAGIC_QP)
+		PTL_FATAL("not a ptl qp: %p", (void *)q);
+	return qp;
+}
+
+static inline struct ptl_mr *ptl_mr_from_ibv(struct ibv_mr *m)
+{
+	struct ptl_mr *mr = PTL_CONTAINER_OF(m, struct ptl_mr, ibv);
+	if (mr->magic != PTL_MAGIC_MR)
+		PTL_FATAL("not a ptl mr: %p", (void *)m);
+	return mr;
 }
 
 static inline struct ptl_srq *ptl_srq_from_ibv(struct ibv_srq *s)

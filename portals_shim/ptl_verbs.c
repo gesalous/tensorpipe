@@ -6,7 +6,8 @@
  * not yet implemented are stubs that abort with "unimplemented"; they get
  * implemented in the order given by the test ladder in design.md (section 9),
  * so a test that reaches one fails loudly and names it. Implemented ones live
- * in ptl_device.c (device, context, pd, port, gid), ptl_cq.c and ptl_srq.c.
+ * in ptl_device.c (device, context, pd, port, gid), ptl_cq.c, ptl_srq.c, ptl_mr.c
+ * and ptl_qp.c.
  *
  * This library must not link libibverbs and must never call ibv_*: tensorpipe
  * opens it with dlopen(RTLD_LOCAL) and resolves ptl_* with dlsym, so it stays
@@ -15,31 +16,6 @@
 #include "ptl_internal.h"
 
 /* ---- control path ------------------------------------------------------ */
-
-PTL_EXPORT struct ibv_mr *ptl_reg_mr(struct ibv_pd *pd, void *addr, size_t length, int access)
-{
-	PTL_UNIMPLEMENTED();
-}
-
-PTL_EXPORT int ptl_dereg_mr(struct ibv_mr *mr)
-{
-	PTL_UNIMPLEMENTED();
-}
-
-PTL_EXPORT struct ibv_qp *ptl_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
-{
-	PTL_UNIMPLEMENTED();
-}
-
-PTL_EXPORT int ptl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask)
-{
-	PTL_UNIMPLEMENTED();
-}
-
-PTL_EXPORT int ptl_destroy_qp(struct ibv_qp *qp)
-{
-	PTL_UNIMPLEMENTED();
-}
 
 PTL_EXPORT int ptl_get_async_event(struct ibv_context *context, struct ibv_async_event *event)
 {

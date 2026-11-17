@@ -338,22 +338,19 @@ strategies end up the same for the PUT. The NIC's own translation cache is cold
 the first time (about 215 us for a touched 2 MiB buffer): not avoidable from
 here.
 
-Consequences for `reg_mr`/`dereg_mr`:
-- **Prefault, do not require pinning.** `mlock` is the best tool because the
-  kernel does the fault-in itself, with write semantics only on writable
-  private mappings, no data race and no SIGSEGV on a bad range. But it needs
-  `RLIMIT_MEMLOCK` (unlimited on borg, small by default in containers) and
-  `munlock` is not reference-counted (it would also unlock a range another
-  library locked), so by default we `mlock` then immediately `munlock`: the
-  pages stay resident. A failure to `mlock` is ignored (performance only).
-  `TP_PTL_PIN=1` keeps the lock until `dereg_mr`.
-- Pinning does not stop migration or compaction, and the driver already handles
-  those through invalidation (fork result above). Its only extra effect is
-  keeping pages out of swap.
-- The `reg_mr` table still earns its keep: a bad **local** sge address would
-  otherwise kill our own process with SIGSEGV. `post_send` can check each sge
-  against the table and fail with a `WC_LOC_PROT_ERR` completion instead, as
-  verbs does.
+Decision (user): **do not exercise the NIC fault path; pin.** `reg_mr` mlocks
+the page-aligned range and `dereg_mr` munlocks it (implemented in `ptl_mr.c`):
+- `mlock` faults the pages in on the CPU, so the NIC never takes a fault; a
+  failure with ENOMEM (RLIMIT_MEMLOCK) makes `reg_mr` fail with a warning that
+  names `ulimit -l` and `TP_PTL_PIN=0`; a hole in the range gives EFAULT, and a
+  partial lock is undone.
+- `munlock` is not reference counted, so overlapping MRs are handled by
+  `dereg_mr` computing the part no other live MR covers (tested in
+  `probes/mr_pin_test.c`: overlap, unaligned, hole, errors; VmLck returns to 0).
+- `TP_PTL_PIN=0` degrades to prefault only (mlock then munlock).
+- Pinning does not stop migration; the driver copes (fork result above).
+- The MR table also lets `post_send` reject a bad local sge instead of letting
+  the driver SIGSEGV this process.
 
 New hazard: **a peer's late write into memory we already freed kills us.**
 Because any in-range address is accepted by the whole-address LE and an
@@ -365,6 +362,14 @@ would not select by address in a non-matching NI (the first fitting LE on the
 PTE wins). The fix has to be protocol level: do not let the buffer go while
 the peer may still write, which ties into ERR and flush semantics (risk 3
 above). To be examined with T4, and measured across two hosts.
+
+### 9.4 NI limits (measured, `probes/ni_limits.c`, non-matching physical NI)
+
+`max_pt_index 255` and `PtlPTAlloc(PTL_PT_ANY)` succeeds 256 times then returns
+`PTL_PT_FULL`; `max_entries 4080`, `max_mds 1024`, `max_eqs 960`, `max_msg_size`
+64 MiB, `max_volatile_size` 64. So a PTE per connection would cap a process at
+about 250 connections, and an LE per connection costs entries. The design uses
+one PTE and one LE per context and demultiplexes by qpn in `hdr_data`.
 
 ## 10. Sprint log
 
