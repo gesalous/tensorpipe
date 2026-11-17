@@ -410,6 +410,28 @@ delivers data events pairwise swapped (holding one across polls). With it the
 burst saw 10002 early arrivals on the server and still passed in both directions.
 The in-process suite does not trigger it (one write in flight at a time).
 
+**Many connections** (`tests/xhost_many.cc`, `tests/run_many.sh`; N concurrent
+connections between borg0 and borg1, one thread each, all sharing the context's
+one NI, EQ, CQ, SRQ, PTE and LE; each connection echoes 12 messages from 1 B to
+3 MiB and then a 200 x 64 B burst, with a per-connection data pattern):
+
+| Connections | Echoed | Client time | Result |
+|---|---|---|---|
+| 1, 8, 32, 128, 256 | up to 3.6 GB | up to 0.56 s | pass |
+| 1000 | 14 GB | 2.9 s | pass |
+| 2000 | 28 GB | 7.3 s | pass |
+| 128 and 512 with `TP_PTL_TEST_SWAP=1` | 1.8 / 7.2 GB | 0.8 / 1.8 s | pass, 6400 / 23504 early arrivals reordered |
+
+About 4-6 GB/s aggregate (counting both directions of the echo). The shared LE has
+no connection-count ceiling: 2000 connections is far beyond the 255-PTE limit
+that a PTE per ring would hit. Each connection pins 2 x 2 MiB per side, so 2000
+connections lock about 8 GB per process (memlock was unlimited on borg).
+Qpns are 16 bits, so a context can hold up to 65535 QPs.
+
+The full test binary under the shim: **124/124 tests pass** (30 suites; the `Ibv`
+ones go through the shim). It does not include the pipe tests over ibv: they only
+use shm/uv/cma transports, so pipe-level coverage of the shim needs the benchmark.
+
 Harness note: the server must not close before the client has read its last
 message: a TCP EOF can be seen before the final data event is polled, and tensorpipe
 then fails the read with `eof`. The harness has the client send a "bye".
