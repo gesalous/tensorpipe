@@ -260,8 +260,8 @@ Proposed shim behaviour (**OPEN** items in section 12):
 
 | Function | Behaviour |
 |---|---|
-| `reg_mr` | bookkeeping only: `struct ptl_mr` embedding `ibv_mr` (`addr`, `length`, `lkey`, `rkey`, `pd`). No Portals call, because the context's LE and MD already cover the whole address space. Reject length 0 and a PD of another context. `lkey = rkey = non-zero handle` |
-| `dereg_mr` | frees it; warns if the PD is gone |
+| `reg_mr` | no Portals call (the context's LE and MD cover the whole address space and the NIC walks page tables, see 9.3). Does three things: validate the range is mapped (`mincore`, else `EFAULT`); **prefault** it best-effort (`mlock` then `munlock`; `TP_PTL_PIN=1` keeps it locked until `dereg_mr`); keep a `struct ptl_mr` (embedding `ibv_mr`: `addr`, `length`, `lkey`, `rkey`, `pd`) so `post_send` can check local sges against it. Reject length 0 and a PD of another context. `lkey = rkey = non-zero handle` |
+| `dereg_mr` | removes it from the table; `munlock` only in `TP_PTL_PIN` mode; warns if the PD is gone |
 | `create_qp` | allocate qpn (non-zero, **16 bit**, per-context table so the receive path can map `dest_qpn` to the QP); check `RC`, `srq != NULL`, both CQs and the PD in the same context; fill `cap` with the granted values; state RESET; keep `sq_sig_all` |
 | `modify_qp` | enforce the state machine RESET -> INIT -> RTR -> RTS, any -> ERR/RESET, and the required masks for each step (return `EINVAL` otherwise, as libibverbs does). RTR stores `remote = {nid, pid, pte, qpn}` from `dgid` and `dest_qp_num` and rejects a gid without the `PTL4` magic. ERR marks the QP so later posts fail; flushing outstanding WRs belongs to T3 |
 | `destroy_qp` | remove from the context's qpn table; events that arrive later for an unknown qpn are dropped with a debug message; `EBUSY` if still referenced |
@@ -271,7 +271,7 @@ destination qpn, a sequence number and a message kind (5.5). 2 (kind) + 16
 (qpn) + 32 (imm) leaves 14 bits of sequence number, which is enough for any
 realistic reorder window (needs well under 8192). A 24 bit qpn would leave 6.
 
-Risks to retire before or in T3 (cheap experiments, not part of the unit tests):
+Risks to retire before or in T3 (cheap experiments, not part of the unit tests). **Risks 1 and 2 are retired, see 9.3**; the probe is `probes/loopback_probe.c`:
 1. **Loopback**: a PUT from the process NI to its own nid/pid/pte (all unit
    tests talk to themselves). Not exercised anywhere in the earlier work that
    I found. A standalone probe calling the shim functions directly can answer
@@ -283,6 +283,72 @@ Risks to retire before or in T3 (cheap experiments, not part of the unit tests):
 3. **ERR semantics**: tensorpipe moves the QP to ERR at close while sends may
    be in flight; IB flushes them with `WC_WR_FLUSH_ERR`. We need an answer
    before T4.
+
+### 9.3 Memory and the NIC's page-table walk (measured, `probes/loopback_probe.c`)
+
+BXIv2 resolves every source and destination buffer itself: it walks the
+process page tables, and on a miss the **driver faults the pages in on the NIC's
+behalf**. Kernel log (`bxi 0000:01:00.0`): `Fault for pid N rdonly 0
+V2P_IT_CONTEXT ...`, `Failed to fault in 1 pages`. There is nothing to register,
+and the shim's whole-address MD and LE (5.1) are the whole Portals-side story.
+One process, loopback PUTs through the shim's own resources, borg1, kernel
+4.18.0-553 (EL8), memlock unlimited:
+
+| Case | Result |
+|---|---|
+| zero-length PUT with `hdr_data`, no buffers | OK; PUT, SEND and ACK events all carry what we expect, `hdr_data` intact |
+| 384 B, 4 KiB, 2 MiB between touched buffers | OK, data correct |
+| destination a fresh, **never touched** `mmap` (4 KiB, 2 MiB ring, middle of an untouched 1 GiB `MAP_NORESERVE`) | OK, data correct |
+| destination or source pages dropped by `MADV_DONTNEED` after use | OK, data correct (the NIC does not use stale translations) |
+| source never touched (zero pages) | OK, zeros delivered |
+| after `fork()` (copy on write) | **OK**: translations are invalidated (v2p misses reappear after the fork); the child still reads the pre-fork byte, the parent sees the PUT. No `ibv_fork_init`-style trap |
+| 2000 back-to-back 64 B PUTs to self | 2000 delivered, 0 order inversions (loopback only: says nothing about two hosts) |
+| destination **unmapped** | the driver kills the process with **SIGSEGV** (`si_code 1 SEGV_MAPERR`, `V2P SIGSEGV ... si_addr`); no error event, no completion |
+
+So **pinning is not needed for correctness**. What it changes is first-use cost.
+Time to PUT 2 MiB (the size of a tensorpipe ring), loopback, 3 runs each, and
+the CPU-side cost of preparing the memory:
+
+| Preparation | PUT time | Prefault cost |
+|---|---|---|
+| none (untouched) | about 2100 us | none |
+| `MAP_POPULATE` | about 225 us | in `mmap` |
+| touch each page (`atomic or 0`) | about 224 us | about 220 us |
+| `mlock` | about 225 us | about 175 us |
+
+Faulting through the NIC costs about 5 times what faulting from the CPU costs
+(about 4 us per 4 KiB page versus under 0.5 us), and all three prefault
+strategies end up the same for the PUT. The NIC's own translation cache is cold
+the first time (about 215 us for a touched 2 MiB buffer): not avoidable from
+here.
+
+Consequences for `reg_mr`/`dereg_mr`:
+- **Prefault, do not require pinning.** `mlock` is the best tool because the
+  kernel does the fault-in itself, with write semantics only on writable
+  private mappings, no data race and no SIGSEGV on a bad range. But it needs
+  `RLIMIT_MEMLOCK` (unlimited on borg, small by default in containers) and
+  `munlock` is not reference-counted (it would also unlock a range another
+  library locked), so by default we `mlock` then immediately `munlock`: the
+  pages stay resident. A failure to `mlock` is ignored (performance only).
+  `TP_PTL_PIN=1` keeps the lock until `dereg_mr`.
+- Pinning does not stop migration or compaction, and the driver already handles
+  those through invalidation (fork result above). Its only extra effect is
+  keeping pages out of swap.
+- The `reg_mr` table still earns its keep: a bad **local** sge address would
+  otherwise kill our own process with SIGSEGV. `post_send` can check each sge
+  against the table and fail with a `WC_LOC_PROT_ERR` completion instead, as
+  verbs does.
+
+New hazard: **a peer's late write into memory we already freed kills us.**
+Because any in-range address is accepted by the whole-address LE and an
+unresolvable fault is a process-wide SIGSEGV, a write still in flight when we
+`munmap` a ring buffer (tensorpipe frees them when the connection goes away)
+crashes the process. With real verbs this is a remote-access error on the
+peer. Registering does not help (we cannot pin freed memory), and a per-MR LE
+would not select by address in a non-matching NI (the first fitting LE on the
+PTE wins). The fix has to be protocol level: do not let the buffer go while
+the peer may still write, which ties into ERR and flush semantics (risk 3
+above). To be examined with T4, and measured across two hosts.
 
 ## 10. Sprint log
 
@@ -304,6 +370,8 @@ Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,
   its own PID, TX ring, EQ and MD; the 65th fails with `PTL_NO_SPACE` (rc 6)
   (`04_multi_command_queues/README.md`). Hence one NI per process here. A node
   with many PyTorch worker processes, or other Portals jobs, can exhaust them.
+- **Memory needs no registration.** The NIC walks page tables and the driver
+  faults pages in; an unresolvable fault is a SIGSEGV to the process (9.3).
 - **A single persistent LE works at rate.** `08_portals_rate/bigle.c`: one 128 MiB
   persistent LE, 512 B puts: about 4.0 M puts/s with no events, 1.8 M/s when the
   initiator takes send events, 1.4 M/s with send + ack events, one initiator.
@@ -316,6 +384,8 @@ Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,
   control plane; we have no control plane).
 
 ## 12. Open questions (summary)
+0. Late peer writes into freed memory crash the process (9.3): protocol-level
+   quiesce before freeing a ring; to be designed in T4.
 0. T2: qpn width (16 bit proposed, 9.2) and per-context qpn table; how strictly
    `modify_qp` validates masks; whether `rkey` should encode anything.
 1. rkey enforcement vs whole-address-space LE (5.3).
