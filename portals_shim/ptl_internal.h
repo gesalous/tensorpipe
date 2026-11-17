@@ -74,6 +74,9 @@ struct ptl_ctx {
 	pthread_mutex_t qp_lock;
 	uint32_t next_qpn;
 	struct ptl_srq *srqs; /* all live SRQs, guarded by lock */
+	ptl_event_t held;     /* TP_PTL_TEST_SWAP: a data event held back to be swapped */
+	bool has_held;
+	uint32_t held_polls; /* polls since it was held */
 };
 
 struct ptl_pd {

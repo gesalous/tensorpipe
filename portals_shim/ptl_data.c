@@ -252,6 +252,35 @@ static void match_receives(struct ptl_ctx *ctx)
 	}
 }
 
+/* Test aid, TP_PTL_TEST_SWAP=1: deliver data writes pairwise swapped, as if the network
+ * had reordered them, to exercise the reorder buffer on a network that does not. */
+static bool test_swap_enabled(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("TP_PTL_TEST_SWAP");
+		v = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return v == 1;
+}
+
+static void handle_event_swapping(struct ptl_ctx *ctx, const ptl_event_t *ev)
+{
+	if (!test_swap_enabled() || ev->type != PTL_EVENT_PUT || (ev->hdr_data >> 62) != PTL_KIND_DATA) {
+		handle_event(ctx, ev);
+		return;
+	}
+	if (!ctx->has_held) {
+		ctx->held = *ev;
+		ctx->has_held = true;
+		ctx->held_polls = 0;
+		return;
+	}
+	handle_event(ctx, ev);
+	handle_event(ctx, &ctx->held);
+	ctx->has_held = false;
+}
+
 PTL_EXPORT int ptl_poll_cq(struct ibv_cq *ibv_cq, int num_entries, struct ibv_wc *wc)
 {
 	struct ptl_cq *cq = ptl_cq_from_ibv(ibv_cq);
@@ -268,7 +297,11 @@ PTL_EXPORT int ptl_poll_cq(struct ibv_cq *ibv_cq, int num_entries, struct ibv_wc
 			break;
 		if (rc != PTL_OK)
 			PTL_FATAL("PtlEQGet: %s (the event queue overflowed?)", PtlToStr(rc, PTL_STR_ERROR));
-		handle_event(ctx, &ev);
+		handle_event_swapping(ctx, &ev);
+	}
+	if (ctx->has_held && ++ctx->held_polls > 2000) { /* nothing came to swap it with */
+		handle_event(ctx, &ctx->held);
+		ctx->has_held = false;
 	}
 	match_receives(ctx);
 	while (n < num_entries && cq->count > 0) {

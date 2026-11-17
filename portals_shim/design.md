@@ -394,8 +394,25 @@ delivered message waits in the SRQ backlog until a receive wr_id is posted; send
 completions are `PTL_EVENT_ACK`s (possibly out of posting order, which tensorpipe
 tolerates: it only counts them). One lock per context guards PtlPut, the EQ, the CQ
 rings, backlogs and reorder state. `*Ibv*` passes 20/20 on borg0 and borg1, in
-process (so loopback PUTs): the reorder path is **not yet exercised on real
-hardware** and two hosts are still to be tested.
+process (so loopback PUTs).
+
+**Two hosts** (`tests/xhost_echo.cc`, run by `tests/run_xhost.sh`; server on one
+host, client on the other, address handed over through an NFS file): echoes of 1 B to
+3 MiB (the 3 MiB + 17 B message wraps the 2 MiB ring, and 2 MiB exactly lands on the
+wrap point) followed by a burst of 20000 pipelined 64 B messages. 20/20 passes
+(10 each way, borg0 <-> borg1), about 200k msg/s for the burst, 2 MiB echo about 2.2
+ms. **No reordering was ever observed** on this path: zero early arrivals in all
+runs, so the real network (one link, one hop) delivers a single flow in order. That
+is an observation, not a guarantee (multiple paths, load).
+
+**The reorder buffer is exercised by a test aid**, `TP_PTL_TEST_SWAP=1`, which
+delivers data events pairwise swapped (holding one across polls). With it the
+burst saw 10002 early arrivals on the server and still passed in both directions.
+The in-process suite does not trigger it (one write in flight at a time).
+
+Harness note: the server must not close before the client has read its last
+message: a TCP EOF can be seen before the final data event is polled, and tensorpipe
+then fails the read with `eof`. The harness has the client send a "bye".
 
 ## 11. Hardware facts from the BXI reverse-engineering work
 

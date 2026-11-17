@@ -13,3 +13,7 @@ set_target_properties(tensorpipe_portals PROPERTIES
 # Stubs ignore their arguments: silence that until they are implemented.
 target_compile_options(tensorpipe_portals PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(tensorpipe_portals PRIVATE ${PORTALS_LIB} pthread)
+
+# Two-process echo test of the ibv transport on the shim (see tests/xhost_echo.cc).
+add_executable(xhost_echo tests/xhost_echo.cc)
+target_link_libraries(xhost_echo PRIVATE tensorpipe)
