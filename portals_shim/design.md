@@ -30,8 +30,8 @@ tensorpipe ibv transport (unchanged call sites)
    |  IbvLib: dlopen(TP_IBV_LIBRARY, RTLD_LOCAL), symbols resolved as ptl_<name>
    v
 libtensorpipe_portals.so  (portals_shim/)     exports ptl_* with ibv_* signatures
-   |  now:   every function is a FATAL "unimplemented" stub
-   |  goal:  Portals4 (PtlNIInit, PtlPut, PtlGet, PtlLEAppend, PtlEQGet ...)
+   |  implemented over Portals4 (PtlNIInit, PtlPut, PtlLEAppend, PtlEQGet ...);
+   |  only post_recv and the async-event calls are still FATAL stubs (unused)
    v
 libportals -> BXIv2
 ```
@@ -58,17 +58,17 @@ Calls used by tensorpipe (from `common/ibv_lib.h`):
 | query_port | **done** | ACTIVE, MTU 4096, `lid = 0` so tensorpipe addresses peers by gid |
 | query_gid | **done** | gid = `"PTL4"`, nid, pid, pte (`struct ptl_gid`) |
 | alloc_pd / dealloc_pd | **done** | trivial object |
-| reg_mr / dereg_mr | stub | **OPEN** see 5.3 |
+| reg_mr / dereg_mr | **done** | no Portals object; validates the range and `mlock`s it (`TP_PTL_PIN=0` to only prefault); table lets `post_send` check local sges (9.3) |
 | create_cq / destroy_cq | **done** | a *logical* CQ: every event of a context arrives on the context's one EQ (5.1), so several CQs can share it |
 | create_srq / destroy_srq | **done** | accounting only (5.4): ring of posted wr_ids |
-| create_qp / destroy_qp | stub | local state: qpn, peer identity, sequence numbers |
-| modify_qp | stub | INIT/RTR/RTS: store peer `(nid,pid,pte,qpn)` from `ah_attr` + `dest_qp_num` |
-| post_send | stub | `RDMA_WRITE_WITH_IMM` -> PtlPut to RMA window; `SEND_WITH_IMM` -> PtlPut to message LE |
+| create_qp / destroy_qp | **done** | RC on an SRQ only; 16-bit per-context qpn table; send/receive sequence state |
+| modify_qp | **done** | strict RESET->INIT->RTR->RTS state machine with required masks; RTR parses the `PTL4` gid and `dest_qp_num`; ERR legal anywhere (no flush yet) |
+| post_send | **done** | `RDMA_WRITE_WITH_IMM` -> `PtlPut` of the sge to `remote_offset = remote_addr`; zero-length `SEND_WITH_IMM` -> zero-length `PtlPut`; both into the peer's one LE (10.x) |
 | post_srq_recv | **done** | records wr_ids; only zero-sge receives (FATAL otherwise) |
 | post_recv | stub | not called by any `Ibv*` test |
-| poll_cq | partial | T1: drains nothing and returns 0; any event is FATAL until the data path (T3) |
-| get_async_event / ack_async_event | stub | no events generated initially |
-| event_type_str / wc_status_str | stub | local tables |
+| poll_cq | **done** | drains the EQ (256 events per call), turns ACK events into send completions and PUT events into receive completions through the reorder buffer and SRQ backlog (10.x) |
+| get_async_event / ack_async_event | stub | never called by tensorpipe's ibv transport in any test |
+| event_type_str / wc_status_str | **done** | local string tables |
 
 Tensorpipe does **not** use rdma_cm: QP parameters are exchanged over its own
 TCP socket and applied with `modify_qp`. So the SPDK control-plane server
@@ -198,25 +198,27 @@ was recorded (`portals_shim/test-call-matrix.txt`, measured with the forwarding 
 |---|---|---|---|
 | T0 | `IbvSockaddr.*` (4) | none | none |
 | T1 (**passes**) | `Context_DomainDescriptor`, `Listener_CreateAfterClosingContextAndThenGetAddress` | get/free_device_list, open/close_device, query_port, query_gid, alloc/dealloc_pd, create/destroy_cq, create/destroy_srq | `post_srq_recv` (32), `poll_cq` |
-| T2 | `Context_Basics`, `Listener_Basics`, `Listener_CreateThenClose...`, `Listener_AcceptCallbacksAreQueued`, `Listener_IncomingConnectionsAreQueued`, `Connection_InitializationError` | create/destroy_qp, **modify_qp** (INIT/RTR/RTS), reg_mr, dereg_mr | still no `post_send` |
-| T3 | `Connection_Initialization`, `Connection_NopWrite` | none new | first `post_send` (2): one write-with-imm + ack, tiny |
-| T4 | `Connection_QueueWritesBeforeReads` (20 sends), `IbvTransportTest.QueueWrites` (6), `NopWriteWrapAround` (7) | none new | many writes on one QP: **first real exercise of ordering** (section 6), ring wrap-around |
-| T5 | `IbvTransportTest.Chunking`, `ChunkingImplicitRead` (12 sends each) | none new | large payloads split into ring-sized writes; heavy `poll_cq` |
+| T2 (**passes**) | `Context_Basics`, `Listener_Basics`, `Listener_CreateThenClose...`, `Listener_AcceptCallbacksAreQueued`, `Listener_IncomingConnectionsAreQueued`, `Connection_InitializationError` | create/destroy_qp, **modify_qp** (INIT/RTR/RTS), reg_mr, dereg_mr | still no `post_send` |
+| T3 (**passes**) | `Connection_Initialization`, `Connection_NopWrite` | none new | first `post_send` (2): one write-with-imm + ack, tiny |
+| T4 (**passes**) | `Connection_QueueWritesBeforeReads` (20 sends), `IbvTransportTest.QueueWrites` (6), `NopWriteWrapAround` (7) | none new | many writes on one QP: **first real exercise of ordering** (section 6), ring wrap-around |
+| T5 (**passes**) | `IbvTransportTest.Chunking`, `ChunkingImplicitRead` (12 sends each) | none new | large payloads split into ring-sized writes; heavy `poll_cq` |
 
 Observations that shape the implementation:
 - T1 needs no QP, MR, or Portals data movement: pure bring-up. It is the right
   place to add the NI, EQ and PTE setup and the fake device.
 - `get_async_event`, `ack_async_event`, `event_type_str`, `wc_status_str`,
   `post_recv` were never called by any `Ibv*` test (`wc_status_str` appears only in
-  verbose logging). They stay stubs until something calls them.
+  verbose logging). `post_recv`, `get_async_event` and `ack_async_event` stay stubs
+  until something calls them (`wc_status_str` and `event_type_str` are now simple tables).
 - Every test creates its own contexts, QPs and MRs within one process: both ends
   of each connection are in the same process, so the first Portals traffic is
   loopback to self (same nid/pid). Cross-host (borg0 <-> borg1) needs a separate
   harness; the unit tests alone will not cover it.
 - T2 is the first place the peer identity, `modify_qp` parameters and qpn
   allocation (section 5.2) have to be real.
-- Beyond the `Ibv*` tests, `core/pipe_test` and channel tests may select the ibv
-  transport; not yet checked (**TBD**).
+- Beyond the `Ibv*` tests, `core/pipe_test` and the channel tests do **not** use the
+  ibv transport (checked: only shm/uv/cma appear), so pipe-level coverage needs the
+  benchmark or a custom test (10.x).
 
 ### 9.1 T1 as implemented (sprint 1)
 
@@ -378,9 +380,10 @@ one PTE and one LE per context and demultiplexes by qpn in `hdr_data`.
 | 0 | `TP_IBV_LIBRARY` loader, `ptl_*` forwarding shim, baseline | done, 19/19 on borg1 (forwarding bodies since replaced by stubs) |
 | 0b | All `ptl_*` bodies replaced by FATAL stubs; test ladder + `run_tiers.sh` | done: T0 passes, T1+ abort at `ptl_get_device_list` |
 | 1 | T1: NI/EQ/PTE bring-up, fake device, PD, CQ, SRQ | **done**: T1 passes, 200/200 repetitions on borg0 and borg1 |
-| 2 | T2: QP state, `modify_qp`, MR (analysis in 9.2) | next |
-| 3 | T3+T4: `post_send` (write-imm, send-imm), receive path, `poll_cq`, sequence numbers + reorder buffer, fault-injection test | planned |
-| 4 | T5, cross-host borg0 <-> borg1, then pipe/channel tests | planned |
+| 2 | T2: QP state, `modify_qp`, MR with pinning (9.2, 9.3) | **done**: T2 passes, 100/100 on both hosts |
+| 3 | T3-T5: `post_send`, receive path, `poll_cq`, sequence numbers + reorder buffer, `TP_PTL_TEST_SWAP` fault injection | **done**: whole `tensorpipe_test` binary 124/124, `*Ibv*` 20/20 on both hosts |
+| 3b | Two-host echo and many-connection stress (`tests/`) | **done**: 20/20 echo runs; 1 to 2000 connections; 128 and 512 with forced reordering |
+| 4 | Benchmark/pipe-level run over ibv; freed-memory protection; ERR flush; EQ overflow policy | next |
 
 ### 10.x Sprint 3 (T3-T5): the data path
 
@@ -459,13 +462,27 @@ Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,
   control plane; we have no control plane).
 
 ## 12. Open questions (summary)
-0. Late peer writes into freed memory crash the process (9.3): protocol-level
-   quiesce before freeing a ring; to be designed in T4.
-0. T2: qpn width (16 bit proposed, 9.2) and per-context qpn table; how strictly
-   `modify_qp` validates masks; whether `rkey` should encode anything.
-1. rkey enforcement vs whole-address-space LE (5.3).
-2. `hdr_data` layout (5.5).
-3. EQ sizing / overflow policy (5.4).
-4. Lost-PUT handling in the reorder buffer (6).
-5. Fake-device gating: when is the Portals device "present" (4).
-6. Interaction with other Portals users in the same process (NI refcount).
+
+Resolved: qpn width (16 bits, 9.2); `hdr_data` layout (10.x); `modify_qp` strictness
+(strict masks and transitions); rkeys are not enforced (the LE is whole-address;
+isolation would be a PTE per ring, kept as an optional later layer, 9.4).
+
+Open:
+1. Late peer writes into freed memory SIGSEGV the process (9.3): needs a
+   protocol-level quiesce before a ring is freed, or per-ring LEs that are
+   unlinked at `dereg_mr` (turns the write into a dropped put).
+2. Per-ring isolation needs the sender to know the ring base (`remote_offset =
+   remote_addr - base`); possible answers in 9.4 discussion, not decided.
+3. Error handling: ERR does not flush outstanding work; a failed send becomes a
+   `RETRY_EXC_ERR` completion without QP-level cleanup; a lost PUT would stall the
+   reorder buffer forever (6).
+4. EQ sizing and overflow policy (an overflow is currently FATAL).
+5. Reordering has never been seen on the real network (one link); only the forced
+   `TP_PTL_TEST_SWAP` path exercises the reorder buffer. Multi-path or loaded
+   fabrics are untested.
+6. Pipe/channel level coverage over ibv (benchmark) is untested.
+7. Interaction with other Portals users in the same process (NI refcount); one NI
+   per process because the NIC has 64 command queues.
+8. BXIv3 (no matching, no iovec): what changes in addressing/registration, PTE
+   count, `hdr_data` width and ordering; `reg_mr` and the one header with the
+   `hdr_data` layout are the places to adapt.
