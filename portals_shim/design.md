@@ -202,6 +202,88 @@ Observations that shape the implementation:
 - Beyond the `Ibv*` tests, `core/pipe_test` and channel tests may select the ibv
   transport; not yet checked (**TBD**).
 
+### 9.1 T1 as implemented (sprint 1)
+
+What tensorpipe does in T1: `Reactor` builds ctx, PD, CQ and SRQ, reads its own
+address (`query_port`, `query_gid`), posts 32 receives per refill, and polls.
+Nothing is sent. What the shim does for each step:
+
+| Step | tensorpipe call | Shim behaviour (file) |
+|---|---|---|
+| find a device | `get_device_list` | tries to create the process NI (`ptl_ni.c`); returns one device `portals0`, or an empty list if Portals is unusable, so the transport reports "not viable" instead of crashing (`ptl_device.c`) |
+| open it | `open_device` | allocates `ptl_ctx` (ibv_context embedded first) and builds the context's Portals resources: EQ, whole-address MD, PTE, persistent LE (5.1). Failure unwinds in reverse order and sets `errno` |
+| address | `query_port`, `query_gid` | port ACTIVE, MTU 4096, **lid 0**; gid = `struct ptl_gid {"PTL4", nid, pid, pte}` |
+| PD | `alloc_pd` | trivial object; counts toward the context's open-object leak check |
+| CQ | `create_cq` | logical object (no Portals resource); rejects completion channels |
+| SRQ | `create_srq` | ring of `max_wr` wr_ids; no Portals resource |
+| refill | `post_srq_recv` | appends wr_ids; `ENOMEM` and `bad_wr` when full; FATAL for a receive with sges (tensorpipe posts none) |
+| poll | `poll_cq` | `PtlEQGet` under the context lock; returns 0 when empty; any event is FATAL for now |
+| teardown | `destroy_*`, `close_device` | LE unlink (retry while `PTL_IN_USE`), PTE free, MD release, EQ free; warns if a PD/CQ/SRQ is still alive |
+
+Process NI (`ptl_ni.c`): `PtlInit`, `PtlNIInit(NO_MATCHING | PHYSICAL, PID_ANY,
+NULL limits)`, `PtlGetPhysId`; finalised by `atexit`. Created once and never
+re-created inside a process.
+
+Debug: `TP_PTL_LOG=2` prints NI and context creation. Verified: T0 and T1 pass
+on borg1; T1 passes 200 of 200 repetitions on borg0 and borg1, with no
+warnings and no leak messages.
+
+Known limits at this point: no remote protection (5.3); no event handling;
+`ptl_ni_get` is the only global state; `get_device_list` creates the NI as a
+side effect.
+
+### 9.2 T2 analysis: QP and MR (next)
+
+Functions: `reg_mr`, `dereg_mr`, `create_qp`, `modify_qp`, `destroy_qp`. Still
+no data on the wire. What tensorpipe does (facts from `ibv.cc`,
+`connection_impl.cc`):
+
+- Per connection it creates **one QP**: `RC`, `send_cq = recv_cq = the shared
+  CQ`, `srq = the shared SRQ`, `cap.max_send_wr = 2048`, `max_send_sge = 1`,
+  **`sq_sig_all = 1`** (every send, including the zero-length acks, must
+  complete) and registers the QP with the reactor by `qp->qp_num` straight
+  after INIT, so the qpn must be non-zero and stable from `create_qp` on.
+- **Four `modify_qp` calls per QP**: INIT (`STATE|PKEY_INDEX|PORT|ACCESS_FLAGS`),
+  RTR (`STATE|AV|PATH_MTU|DEST_QPN|RQ_PSN|MAX_DEST_RD_ATOMIC|MIN_RNR_TIMER`),
+  RTS (`STATE|SQ_PSN|TIMEOUT|RETRY_CNT|RNR_RETRY|MAX_QP_RD_ATOMIC`) and ERR at
+  close. The peer address arrives in RTR: `ah_attr.is_global = 1`,
+  `grh.dgid` (our `ptl_gid`) and `dest_qp_num`; `dlid` is not used because we
+  report `lid = 0`.
+- **Two MRs per connection** (inbox 2 MiB with `LOCAL_WRITE|REMOTE_WRITE`,
+  outbox 2 MiB `LOCAL_WRITE`). `rkey` of the inbox and the inbox address are
+  sent to the peer in the setup information; `lkey` of the outbox goes into
+  every send sge.
+- Both ends of a connection in the unit tests share one ibv_context, so QP
+  lookup must work for a QP talking to a QP of the same context.
+
+Proposed shim behaviour (**OPEN** items in section 12):
+
+| Function | Behaviour |
+|---|---|
+| `reg_mr` | bookkeeping only: `struct ptl_mr` embedding `ibv_mr` (`addr`, `length`, `lkey`, `rkey`, `pd`). No Portals call, because the context's LE and MD already cover the whole address space. Reject length 0 and a PD of another context. `lkey = rkey = non-zero handle` |
+| `dereg_mr` | frees it; warns if the PD is gone |
+| `create_qp` | allocate qpn (non-zero, **16 bit**, per-context table so the receive path can map `dest_qpn` to the QP); check `RC`, `srq != NULL`, both CQs and the PD in the same context; fill `cap` with the granted values; state RESET; keep `sq_sig_all` |
+| `modify_qp` | enforce the state machine RESET -> INIT -> RTR -> RTS, any -> ERR/RESET, and the required masks for each step (return `EINVAL` otherwise, as libibverbs does). RTR stores `remote = {nid, pid, pte, qpn}` from `dgid` and `dest_qp_num` and rejects a gid without the `PTL4` magic. ERR marks the QP so later posts fail; flushing outstanding WRs belongs to T3 |
+| `destroy_qp` | remove from the context's qpn table; events that arrive later for an unknown qpn are dropped with a debug message; `EBUSY` if still referenced |
+
+Why qpn is 16 bit: `hdr_data` is 64 bit and has to carry the imm (32), the
+destination qpn, a sequence number and a message kind (5.5). 2 (kind) + 16
+(qpn) + 32 (imm) leaves 14 bits of sequence number, which is enough for any
+realistic reorder window (needs well under 8192). A 24 bit qpn would leave 6.
+
+Risks to retire before or in T3 (cheap experiments, not part of the unit tests):
+1. **Loopback**: a PUT from the process NI to its own nid/pid/pte (all unit
+   tests talk to themselves). Not exercised anywhere in the earlier work that
+   I found. A standalone probe calling the shim functions directly can answer
+   it in minutes.
+2. **Unregistered memory** as MD/LE target: the inbox is anonymous `mmap`
+   memory, untouched until written. The earlier `bigle` run used a 128 MiB
+   `malloc`ed LE, which is encouraging, but a page the NIC must fault in is
+   different from a touched one.
+3. **ERR semantics**: tensorpipe moves the QP to ERR at close while sends may
+   be in flight; IB flushes them with `WC_WR_FLUSH_ERR`. We need an answer
+   before T4.
+
 ## 10. Sprint log
 
 | Sprint | Content | Status |
@@ -209,7 +291,7 @@ Observations that shape the implementation:
 | 0 | `TP_IBV_LIBRARY` loader, `ptl_*` forwarding shim, baseline | done, 19/19 on borg1 (forwarding bodies since replaced by stubs) |
 | 0b | All `ptl_*` bodies replaced by FATAL stubs; test ladder + `run_tiers.sh` | done: T0 passes, T1+ abort at `ptl_get_device_list` |
 | 1 | T1: NI/EQ/PTE bring-up, fake device, PD, CQ, SRQ | **done**: T1 passes, 200/200 repetitions on borg0 and borg1 |
-| 2 | T2: QP state, `modify_qp`, MR | planned |
+| 2 | T2: QP state, `modify_qp`, MR (analysis in 9.2) | next |
 | 3 | T3+T4: `post_send` (write-imm, send-imm), receive path, `poll_cq`, sequence numbers + reorder buffer, fault-injection test | planned |
 | 4 | T5, cross-host borg0 <-> borg1, then pipe/channel tests | planned |
 
@@ -234,6 +316,8 @@ Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,
   control plane; we have no control plane).
 
 ## 12. Open questions (summary)
+0. T2: qpn width (16 bit proposed, 9.2) and per-context qpn table; how strictly
+   `modify_qp` validates masks; whether `rkey` should encode anything.
 1. rkey enforcement vs whole-address-space LE (5.3).
 2. `hdr_data` layout (5.5).
 3. EQ sizing / overflow policy (5.4).
