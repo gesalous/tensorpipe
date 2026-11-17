@@ -25,6 +25,14 @@ PTL_EXPORT struct ibv_srq *ptl_create_srq(struct ibv_pd *ibv_pd, struct ibv_srq_
 		errno = ENOMEM;
 		return NULL;
 	}
+	srq->rx_cap = 1024;
+	srq->rx = calloc(srq->rx_cap, sizeof(*srq->rx));
+	if (srq->rx == NULL) {
+		free(srq->wr_ids);
+		free(srq);
+		errno = ENOMEM;
+		return NULL;
+	}
 	srq->magic = PTL_MAGIC_SRQ;
 	srq->pd = pd;
 	srq->cap = attr->attr.max_wr;
@@ -32,6 +40,10 @@ PTL_EXPORT struct ibv_srq *ptl_create_srq(struct ibv_pd *ibv_pd, struct ibv_srq_
 	srq->ibv.context = pd->ibv.context;
 	srq->ibv.srq_context = attr->srq_context;
 	srq->ibv.pd = ibv_pd;
+	pthread_mutex_lock(&pd->ctx->lock);
+	srq->next = pd->ctx->srqs;
+	pd->ctx->srqs = srq;
+	pthread_mutex_unlock(&pd->ctx->lock);
 	__atomic_fetch_add(&pd->ctx->open_objects, 1, __ATOMIC_RELAXED);
 	return &srq->ibv;
 }
@@ -39,9 +51,18 @@ PTL_EXPORT struct ibv_srq *ptl_create_srq(struct ibv_pd *ibv_pd, struct ibv_srq_
 PTL_EXPORT int ptl_destroy_srq(struct ibv_srq *ibv_srq)
 {
 	struct ptl_srq *srq = ptl_srq_from_ibv(ibv_srq);
+	struct ptl_ctx *ctx = srq->pd->ctx;
+	struct ptl_srq **pp;
 
-	__atomic_fetch_sub(&srq->pd->ctx->open_objects, 1, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&ctx->lock);
+	for (pp = &ctx->srqs; *pp != NULL && *pp != srq; pp = &(*pp)->next)
+		;
+	if (*pp != NULL)
+		*pp = srq->next;
+	pthread_mutex_unlock(&ctx->lock);
+	__atomic_fetch_sub(&ctx->open_objects, 1, __ATOMIC_RELAXED);
 	srq->magic = 0;
+	free(srq->rx);
 	pthread_mutex_destroy(&srq->lock);
 	free(srq->wr_ids);
 	free(srq);
@@ -71,4 +92,22 @@ PTL_EXPORT int ptl_post_srq_recv(struct ibv_srq *ibv_srq, struct ibv_recv_wr *wr
 	}
 	pthread_mutex_unlock(&srq->lock);
 	return rc;
+}
+
+void ptl_srq_push_rx(struct ptl_srq *srq, const struct ptl_rx *rx)
+{
+	if (srq->rx_count == srq->rx_cap) {
+		uint32_t i, ncap = srq->rx_cap * 2;
+		struct ptl_rx *n = calloc(ncap, sizeof(*n));
+		if (n == NULL)
+			PTL_FATAL("out of memory growing the receive backlog to %u", ncap);
+		for (i = 0; i < srq->rx_count; i++)
+			n[i] = srq->rx[(srq->rx_head + i) & (srq->rx_cap - 1)];
+		free(srq->rx);
+		srq->rx = n;
+		srq->rx_cap = ncap;
+		srq->rx_head = 0;
+	}
+	srq->rx[(srq->rx_head + srq->rx_count) & (srq->rx_cap - 1)] = *rx;
+	srq->rx_count++;
 }

@@ -73,6 +73,7 @@ struct ptl_ctx {
 	struct ptl_qp **qps;  /* qpn -> qp, PTL_MAX_QPN + 1 slots */
 	pthread_mutex_t qp_lock;
 	uint32_t next_qpn;
+	struct ptl_srq *srqs; /* all live SRQs, guarded by lock */
 };
 
 struct ptl_pd {
@@ -85,6 +86,9 @@ struct ptl_cq {
 	uint32_t magic;
 	struct ibv_cq ibv;
 	struct ptl_ctx *ctx;
+	/* Completions waiting for poll_cq: a growable ring, guarded by ctx->lock. */
+	struct ibv_wc *ring;
+	uint32_t cap, head, count; /* cap is a power of two */
 };
 
 /* The SRQ is accounting only: Portals needs no posted receive buffer for a PUT
@@ -97,6 +101,16 @@ struct ptl_srq {
 	pthread_mutex_t lock;
 	uint64_t *wr_ids; /* ring of posted receive wr_ids */
 	uint32_t cap, head, count;
+	/* Receive events that arrived before a receive wr_id was posted, oldest
+	 * first. Guarded by ctx->lock (the wr_id ring above by srq->lock). */
+	struct ptl_rx *rx;
+	uint32_t rx_cap, rx_head, rx_count; /* rx_cap is a power of two */
+	struct ptl_srq *next;               /* ctx->srqs list */
+};
+
+/* A delivered receive: becomes a work completion once it gets a wr_id. */
+struct ptl_rx {
+	uint32_t qpn, opcode, imm, byte_len;
 };
 
 /* Address of the peer end of a connection, from the gid given to modify_qp(RTR). */
@@ -120,7 +134,26 @@ struct ptl_qp {
 	enum ibv_mtu mtu;
 	bool peer_valid; /* set by RTR */
 	struct ptl_peer peer;
+	uint32_t tx_seq;  /* next data sequence number to send (qp->lock) */
+	int inflight;     /* posted sends not yet completed (atomic) */
+	uint32_t rx_next; /* next data sequence number to deliver (ctx->lock) */
+	uint64_t *reorder; /* early data events by sequence; lazily allocated (ctx->lock) */
 };
+
+/* ---- hdr_data layout of every PtlPut (design.md 5.5) ---------------------
+ *   [63:62] kind  [61:46] destination qpn  [45:14] imm_data  [13:0] sequence
+ * Only data writes are sequenced: acks are additive and may arrive in any order. */
+#define PTL_KIND_DATA 1ULL
+#define PTL_KIND_ACK 2ULL
+#define PTL_SEQ_BITS 14
+#define PTL_SEQ_MASK ((1U << PTL_SEQ_BITS) - 1)
+#define PTL_HDR(kind, qpn, imm, seq) \
+	(((uint64_t)(kind) << 62) | ((uint64_t)(qpn) << 46) | ((uint64_t)(uint32_t)(imm) << 14) | (uint64_t)(seq))
+
+/* Internal calls between the shim's files (everything with ctx->lock held). */
+void ptl_cq_push(struct ptl_cq *cq, const struct ibv_wc *wc);
+void ptl_srq_push_rx(struct ptl_srq *srq, const struct ptl_rx *rx);
+bool ptl_mr_covers(uint32_t lkey, uint64_t addr, uint64_t len);
 
 /* A memory region is bookkeeping plus pinning: the NIC resolves addresses itself
  * (design.md 9.3), so there is no Portals object behind it. */

@@ -382,6 +382,21 @@ one PTE and one LE per context and demultiplexes by qpn in `hdr_data`.
 | 3 | T3+T4: `post_send` (write-imm, send-imm), receive path, `poll_cq`, sequence numbers + reorder buffer, fault-injection test | planned |
 | 4 | T5, cross-host borg0 <-> borg1, then pipe/channel tests | planned |
 
+### 10.x Sprint 3 (T3-T5): the data path
+
+`ptl_data.c`: `post_send` (RDMA_WRITE_WITH_IMM -> `PtlPut` of the sge to
+`remote_offset = remote_addr`; zero-length SEND_WITH_IMM -> zero-length `PtlPut`;
+both `PTL_ACK_REQ`, `user_ptr` = a malloc'd tracker), event handling and `poll_cq`.
+`hdr_data = kind(2) | dest qpn(16) | imm(32) | seq(14)`. Receive side: a data
+`PTL_EVENT_PUT` is delivered in sequence order through a per-QP reorder buffer (16384
+slots, allocated on first out-of-order arrival); acks are delivered at once; a
+delivered message waits in the SRQ backlog until a receive wr_id is posted; send
+completions are `PTL_EVENT_ACK`s (possibly out of posting order, which tensorpipe
+tolerates: it only counts them). One lock per context guards PtlPut, the EQ, the CQ
+rings, backlogs and reorder state. `*Ibv*` passes 20/20 on borg0 and borg1, in
+process (so loopback PUTs): the reorder path is **not yet exercised on real
+hardware** and two hosts are still to be tested.
+
 ## 11. Hardware facts from the BXI reverse-engineering work
 
 Measured or found earlier (`/home1/private/gesalous/claude/gpu_triggered_io`,

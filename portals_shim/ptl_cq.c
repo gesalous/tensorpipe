@@ -2,9 +2,8 @@
  * Completion queues (sprint 1 / T1).
  *
  * A CQ is a logical object: every event of a context arrives on the context's
- * single EQ and poll_cq turns it into work completions. Several CQs can
- * therefore share one context. Until the data path exists (T3) any event on the
- * EQ is unexpected.
+ * single EQ; ptl_poll_cq (ptl_data.c) drains it and files each completion in the
+ * ring of the CQ it belongs to. Several CQs can therefore share one context.
  */
 #include "ptl_internal.h"
 #include <errno.h>
@@ -29,6 +28,13 @@ PTL_EXPORT struct ibv_cq *ptl_create_cq(struct ibv_context *context, int cqe, vo
 		errno = ENOMEM;
 		return NULL;
 	}
+	cq->cap = 1024;
+	cq->ring = calloc(cq->cap, sizeof(*cq->ring));
+	if (cq->ring == NULL) {
+		free(cq);
+		errno = ENOMEM;
+		return NULL;
+	}
 	cq->magic = PTL_MAGIC_CQ;
 	cq->ctx = ctx;
 	cq->ibv.context = context;
@@ -44,29 +50,25 @@ PTL_EXPORT int ptl_destroy_cq(struct ibv_cq *ibv_cq)
 
 	__atomic_fetch_sub(&cq->ctx->open_objects, 1, __ATOMIC_RELAXED);
 	cq->magic = 0;
+	free(cq->ring);
 	free(cq);
 	return 0;
 }
 
-PTL_EXPORT int ptl_poll_cq(struct ibv_cq *ibv_cq, int num_entries, struct ibv_wc *wc)
+void ptl_cq_push(struct ptl_cq *cq, const struct ibv_wc *wc)
 {
-	struct ptl_cq *cq = ptl_cq_from_ibv(ibv_cq);
-	struct ptl_ctx *ctx = cq->ctx;
-	ptl_event_t ev;
-	int rc;
-
-	(void)wc;
-	if (num_entries <= 0)
-		return 0;
-
-	pthread_mutex_lock(&ctx->lock);
-	rc = PtlEQGet(ctx->eq, &ev);
-	pthread_mutex_unlock(&ctx->lock);
-
-	if (rc == PTL_EQ_EMPTY)
-		return 0;
-	if (rc == PTL_OK || rc == PTL_EQ_DROPPED)
-		PTL_FATAL("event type %d (%s) on poll_cq: event handling arrives with the data path (T3)",
-			  ev.type, PtlToStr(ev.type, PTL_STR_EVENT));
-	PTL_FATAL("PtlEQGet failed: %s", PtlToStr(rc, PTL_STR_ERROR));
+	if (cq->count == cq->cap) {
+		uint32_t i, ncap = cq->cap * 2;
+		struct ibv_wc *n = calloc(ncap, sizeof(*n));
+		if (n == NULL)
+			PTL_FATAL("out of memory growing a completion queue to %u", ncap);
+		for (i = 0; i < cq->count; i++)
+			n[i] = cq->ring[(cq->head + i) & (cq->cap - 1)];
+		free(cq->ring);
+		cq->ring = n;
+		cq->cap = ncap;
+		cq->head = 0;
+	}
+	cq->ring[(cq->head + cq->count) & (cq->cap - 1)] = *wc;
+	cq->count++;
 }

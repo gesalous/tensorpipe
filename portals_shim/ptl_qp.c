@@ -204,9 +204,12 @@ PTL_EXPORT int ptl_destroy_qp(struct ibv_qp *ibv_qp)
 	struct ptl_qp *qp = ptl_qp_from_ibv(ibv_qp);
 	struct ptl_ctx *ctx = qp->ctx;
 
+	pthread_mutex_lock(&ctx->lock); /* no poll_cq may hold this qp while it goes */
 	pthread_mutex_lock(&ctx->qp_lock);
 	ctx->qps[qp->ibv.qp_num] = NULL; /* events for this qpn are dropped from now on */
 	pthread_mutex_unlock(&ctx->qp_lock);
+	pthread_mutex_unlock(&ctx->lock);
+	free(qp->reorder);
 	__atomic_fetch_sub(&ctx->open_objects, 1, __ATOMIC_RELAXED);
 	qp->magic = 0;
 	pthread_mutex_destroy(&qp->lock);

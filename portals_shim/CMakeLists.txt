@@ -6,7 +6,7 @@ project(tensorpipe_portals_shim C)
 
 find_library(PORTALS_LIB portals REQUIRED)
 
-add_library(tensorpipe_portals SHARED ptl_verbs.c ptl_device.c ptl_cq.c ptl_srq.c ptl_ni.c ptl_log.c ptl_mr.c ptl_qp.c)
+add_library(tensorpipe_portals SHARED ptl_verbs.c ptl_device.c ptl_cq.c ptl_srq.c ptl_ni.c ptl_log.c ptl_mr.c ptl_qp.c ptl_data.c)
 set_target_properties(tensorpipe_portals PROPERTIES
   C_VISIBILITY_PRESET hidden
   C_STANDARD 11)

@@ -102,6 +102,24 @@ static void ptl_undo_partial_lock(const struct ptl_mr *mr)
 	pthread_mutex_unlock(&g_mr.lock);
 }
 
+/* Is [addr, addr+len) inside the region with this lkey? */
+bool ptl_mr_covers(uint32_t lkey, uint64_t addr, uint64_t len)
+{
+	const struct ptl_mr *mr;
+	bool ok = false;
+
+	pthread_mutex_lock(&g_mr.lock);
+	for (mr = g_mr.head; mr != NULL; mr = mr->next) {
+		if (mr->ibv.lkey != lkey)
+			continue;
+		ok = addr >= (uint64_t)(uintptr_t)mr->ibv.addr &&
+		     addr + len <= (uint64_t)(uintptr_t)mr->ibv.addr + mr->ibv.length;
+		break;
+	}
+	pthread_mutex_unlock(&g_mr.lock);
+	return ok;
+}
+
 PTL_EXPORT struct ibv_mr *ptl_reg_mr(struct ibv_pd *ibv_pd, void *addr, size_t length, int access)
 {
 	struct ptl_pd *pd = ptl_pd_from_ibv(ibv_pd);
